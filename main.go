@@ -9,9 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elastic/go-elasticsearch/v8"
+	"github.com/elastic/go-elasticsearch/v8/esutil"
 	"github.com/zelenin/go-tdlib/client"
 	"gopkg.in/yaml.v3"
 )
+
 type ReplaceWords struct {
 	From string
 	To string
@@ -36,7 +39,7 @@ func check(e error) {
 	}
 }
 
-
+var es *elasticsearch.Client
 var iClient *client.Client
 var config Config
 
@@ -85,13 +88,18 @@ func main() {
 	me := getMe()
 	log.Printf("Me: %s %s [%s]", me.FirstName, me.LastName, me.Username)
 
+
+	es, _ := elasticsearch.NewDefaultClient()
+	log.Println(elasticsearch.Version)
+	log.Println(es.Info())
+
 	// getChats()
 	// cleanMyOldMessages()
 	// showLastGroupMessages()
 	// getFolders()
 	// getChatsFromFolder()
-	Autopost()
-	//logUpdates()
+	// Autopost()
+	logUpdates()
 }
 func applyConfig() {
 	file, err := ioutil.ReadFile("config.local.yml")
@@ -411,31 +419,193 @@ func logUpdates() {
 	}
 }
 
-func saveUpdate(update client.Type) {
-
-	// type UpdateUserStatus struct {
-	// 	UserId int64
-	// 	NewStatus
-	//  }
-
-	// if (update.getClass() == client.UpdateUserStatus){
-	// 	UserId int64
-	// 	NewStatus string
-	// }
-	// UpdateUserStatus
-
-
-	// writer := parquet.NewGenericWriter[RowType](output)
-
-	// _, err := writer.Write([]RowType{
-	// 		...
-	// })
-	// if err != nil {
-	// 		...
-	// }
-
-	// // Closing the writer is necessary to flush buffers and write the file footer.
-	// if err := writer.Close(); err != nil {
-	// 		...
-	// }
+func convertUserStatus(userStatus client.UserStatus) string {
+	return strings.ToLower(strings.Replace(userStatus.UserStatusType(), "userStatus", "", 1))
 }
+func getLastOnlineTimestamp(update *client.UpdateUserStatus) int64  {
+	var lastOnlineTime time.Time
+	switch update.Status.UserStatusType() {
+	case client.TypeUserStatusLastMonth:
+		lastOnlineTime = time.Now().Add(time.Duration(-2 * 30 * 24 * time.Hour))
+	case client.TypeUserStatusLastWeek:
+		lastOnlineTime = time.Now().Add(time.Duration(-2 * -7 * 24 * time.Hour))
+	case client.TypeUserStatusRecently:
+		lastOnlineTime = time.Now().Add(time.Duration(-7 * 24 * time.Hour))
+	case client.TypeUserStatusOffline:
+		typedStatus := update.Status.(*client.UserStatusOffline)
+		lastOnlineTime = time.Unix(int64(typedStatus.WasOnline), 0)
+	case client.TypeUserStatusOnline:
+		typedStatus := update.Status.(*client.UserStatusOnline)
+		lastOnlineTime = time.Unix(int64(typedStatus.Expires), 0)
+	}
+	return lastOnlineTime.Unix()
+}
+
+func saveUpdate(update client.Type) {
+	type UpdateUserStatus struct {
+		time time.Time
+		userId int64
+		status string
+		lastOnline int64
+	}
+
+	var doc interface{}
+		if updateUserStatus, ok := update.(*client.UpdateUserStatus); ok {
+			doc = UpdateUserStatus{
+				time: time.Now(),
+				userId: updateUserStatus.UserId,
+				status: convertUserStatus(updateUserStatus.Status),
+				lastOnline: getLastOnlineTimestamp(updateUserStatus),
+			}
+		} else {
+			return
+		}
+
+
+	res, _ := es.Index("tg-assist.updates.user-status", esutil.NewJSONReader(&doc))
+	fmt.Println(res)
+}
+// func saveUpdate(update client.Type) {
+
+// 	type UpdateUserStatus struct {
+// 		time int64
+// 		UserId int64
+// 		NewStatus string
+// 	}
+
+// 	nowNano := time.Now().UnixNano()
+// 	updateUserStatus, ok := update.(*client.UpdateUserStatus)
+// 	if ok {
+// 		updateUserStatus
+// 	}
+// 	if update.getClass() == client.UpdateUserStatus {
+// 		UserId int64
+// 		NewStatus string
+// 	}
+// 	UpdateUserStatus
+
+
+// 	writer := parquet.NewGenericWriter[RowType](output)
+
+// 	_, err := writer.Write([]RowType{
+// 			...
+// 	})
+// 	if err != nil {
+// 			...
+// 	}
+
+// 	// Closing the writer is necessary to flush buffers and write the file footer.
+// 	if err := writer.Close(); err != nil {
+// 			...
+// 	}
+
+
+// 	import (
+// 		"github.com/apache/arrow/go/v9/arrow/array"
+// 		"github.com/apache/arrow/go/v9/arrow/math"
+// 		"github.com/apache/arrow/go/v9/arrow/memory"
+// 	)
+
+// 		fb := array.NewFloat64Builder(memory.DefaultAllocator)
+
+// 		fb.AppendValues([]float64{1, 3, 5, 7, 9, 11}, nil)
+
+// 		vec := fb.NewFloat64Array()
+// 		math.Float64.Sum(vec)
+
+
+// 	///start
+
+
+// 	func main() {
+// 		fw, err := local.NewLocalFileWriter("arrow.parquet")
+// 		if err != nil {
+// 			log.Println("Can't create file", err)
+// 			return
+// 		}
+// 		mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+// 		schema := arrow.NewSchema(
+// 			[]arrow.Field{
+// 				{Name: "int64", Type: arrow.PrimitiveTypes.Int64},
+// 				{Name: "float64", Type: arrow.PrimitiveTypes.Float64},
+// 				{Name: "str", Type: arrow.BinaryTypes.String},
+// 				{Name: "ts_ms", Type: arrow.FixedWidthTypes.Timestamp_ms},
+// 				{Name: "nullable-int32", Type: arrow.PrimitiveTypes.Int32,
+// 					Nullable: true},
+// 			},
+// 			nil,
+// 		)
+// 		b := array.NewRecordBuilder(mem, schema)
+// 		defer b.Release()
+// 		for idx := range schema.Fields() {
+// 			switch idx {
+// 			case 0:
+// 				b.Field(idx).(*array.Int64Builder).AppendValues(
+// 					[]int64{int64(1), int64(2), int64(3)}, nil,
+// 				)
+// 			case 1:
+// 				b.Field(idx).(*array.Float64Builder).AppendValues(
+// 					[]float64{float64(1.1), float64(1.2), float64(1.3)}, nil,
+// 				)
+// 			case 2:
+// 				b.Field(idx).(*array.StringBuilder).AppendValues(
+// 					[]string{"a", "b", "c"}, nil,
+// 				)
+// 			case 3:
+// 				n := arrow.Timestamp(time.Now().UnixMilli())
+// 				b.Field(idx).(*array.TimestampBuilder).AppendValues([]arrow.Timestamp{n, n, n}, nil)
+// 			case 4:
+// 				colBuilder := b.Field(idx).(*array.Int32Builder)
+// 				colBuilder.Append(1)
+// 				colBuilder.AppendNull()
+// 				colBuilder.Append(2)
+// 				colBuilder.AppendNull()
+// 			}
+// 		}
+// 		rec := b.NewRecord()
+
+// 		w, err := writer.NewArrowWriter(schema, fw, 1)
+// 		if err != nil {
+// 			log.Println("Can't create parquet writer", err)
+// 			return
+// 		}
+// 		if err = w.WriteArrow(rec); err != nil {
+// 			log.Println("WriteArrow error", err)
+// 			return
+// 		}
+// 		if err = w.WriteStop(); err != nil {
+// 			log.Println("WriteStop error", err)
+// 			return
+// 		}
+// 		log.Println("Write Finished")
+// 		fw.Close()
+
+// 		fr, err := local.NewLocalFileReader("arrow.parquet")
+// 		if err != nil {
+// 			log.Println("Can't open file for read", err)
+// 			return
+// 		}
+
+// 		pr, err := reader.NewParquetReader(fr, nil, 1)
+// 		if err != nil {
+// 			log.Println("Can't create parquet reader", err)
+// 			return
+// 		}
+
+// 		num := int(pr.GetNumRows())
+// 		res, err := pr.ReadByNumber(num)
+// 		if err != nil {
+// 			log.Println("Can't read rows", err)
+// 			return
+// 		}
+
+// 		table := ""
+// 		for _, row := range res {
+// 			table = table + fmt.Sprintf("%v\n", row)
+// 		}
+
+// 		log.Printf("Content of table:\n%s", table)
+// 		log.Print("Read Finished")
+// 	}
+// 	///emd
+// }
