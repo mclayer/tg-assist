@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -89,20 +89,77 @@ func main() {
 	log.Printf("Me: %s %s [%s]", me.FirstName, me.LastName, me.Username)
 
 
-	es, _ := elasticsearch.NewDefaultClient()
-	log.Println(elasticsearch.Version)
-	log.Println(es.Info())
 
+	prepareEs()
 	// getChats()
 	// cleanMyOldMessages()
 	// showLastGroupMessages()
 	// getFolders()
 	// getChatsFromFolder()
-	// Autopost()
-	logUpdates()
+	Autopost()
+	loadChats()
+	handleUpdates()
+}
+func loadChat(update *client.UpdateNewChat) {
+	getChatHistory(update.Chat.Id, 200)
+}
+
+func handleUpdates() {
+	listener := iClient.GetListener()
+	defer listener.Close()
+
+	for update := range listener.Updates {
+		log.Printf("%v %v %#v",update.GetClass(), update.GetType(), update)
+		if update.GetType() == client.TypeUpdateNewChat {
+			loadChat(update.(*client.UpdateNewChat))
+		}
+		saveUpdate(update)
+	}
+}
+func prepareEs() {
+	es, _ = elasticsearch.NewClient(elasticsearch.Config{
+		Addresses: []string{
+			"http://mclay-pc.lan:9200",
+		},
+	})
+	log.Println(elasticsearch.Version)
+	log.Println(es.Info())
+
+	res, err := es.Indices.Create(
+		"tg-assist.updates.user_status",
+		es.Indices.Create.WithBody(strings.NewReader(`
+    	{
+				"settings": {
+					"number_of_shards": 1
+				},
+				"mappings": {
+					"properties": {
+						"timestamp": {
+							"type": "date",
+							"format": "strict_date_time"
+						},
+						"userId": {
+							"type": "int"
+						},
+						"status": {
+							"type": "keyword",
+							"index": false
+						},
+						"lastOnline": {
+							"type": "date",
+							"index": false,
+							"format": "strict_date_time_no_millis"
+						}
+					}
+				}
+			}`),
+		),
+	)
+	check(err)
+	log.Println(res)
 }
 func applyConfig() {
-	file, err := ioutil.ReadFile("config.local.yml")
+	file,	err := os.ReadFile("config.local.yml")
 	check(err)
 
 	err = yaml.Unmarshal([]byte(file), &config)
@@ -135,6 +192,41 @@ func getFolders() {
 			log.Printf("NON: %#v", update)
 		}
 	}
+}
+
+
+func loadChats() {
+	_, err := iClient.LoadChats(&client.LoadChatsRequest{
+		Limit: 2147483647,
+	})
+	check(err)
+}
+
+func getChatHistory(chatId int64, limit int32) []*client.Message {
+	var allMsgs []*client.Message
+	var found int32 = 0
+	var fromMessageId int64 = 0
+
+	for found < limit {
+		requestLimit := limit - found
+		if requestLimit > 100 {
+			requestLimit = 100
+		}
+
+		msgs, _ := iClient.GetChatHistory(&client.GetChatHistoryRequest{
+			ChatId: chatId,
+			FromMessageId: fromMessageId,
+			Offset: 0,
+			Limit: requestLimit,
+			OnlyLocal: false,
+		})
+		if(msgs.TotalCount > 0) {
+			fromMessageId = msgs.Messages[msgs.TotalCount-1].Id
+			allMsgs = append(allMsgs, msgs.Messages...)
+			found = found + msgs.TotalCount
+		}
+	}
+	return allMsgs
 }
 
 
@@ -200,6 +292,35 @@ type ChatInfo struct {
 	group *client.Supergroup
 }
 
+func getChatsForSave() []ChatInfo {
+	chatsFromFolder := getChatsFromFolder()
+	chats := make([]ChatInfo, 0, len(chatsFromFolder))
+	for _, chatId := range chatsFromFolder {
+		chat, err := iClient.GetChat(&client.GetChatRequest{
+			ChatId: chatId,
+		})
+		if err != nil {
+			log.Fatalf("getChat error: %s", err)
+		}
+		log.Printf("%s\n", chat.Title)
+		chatTypeSupergroup, ok := chat.Type.(*client.ChatTypeSupergroup)
+		if !ok {
+			continue
+		}
+		group, err := iClient.GetSupergroup(&client.GetSupergroupRequest{
+			SupergroupId: chatTypeSupergroup.SupergroupId,
+		})
+		if err != nil {
+			log.Fatalf("GetSupergroup error: %s", err)
+		}
+		chats = append(chats, ChatInfo{
+			chatId: chatId,
+			group: group,
+		})
+	}
+	return chats
+}
+
 func getChatsForAutoPost() []ChatInfo {
 	chatsFromFolder := getChatsFromFolder()
 	chats := make([]ChatInfo, 0, len(chatsFromFolder))
@@ -249,24 +370,9 @@ func Autopost() {
 		if err != nil {
 			log.Fatalf("SearchChatMessages error: %s", err)
 		}
-		var lastMsgs *client.Messages
 		log.Print("Getting last msgs...")
-		for i := 0; i < 20; i++ {
-			lastMsgs, _ = iClient.GetChatHistory(&client.GetChatHistoryRequest{
-				ChatId: chat.chatId,
-				FromMessageId: 0,
-				Offset: 0,
-				Limit: 20,
-				OnlyLocal: false,
-			})
-			if(lastMsgs.TotalCount >= 20) {
-				continue
-			}
-			log.Printf("got only %d. trying again...", lastMsgs.TotalCount)
-			lastMsgs = nil
-			time.Sleep(1 * time.Second)
-		}
-		if lastMsgs == nil {
+		lastMsgs := getChatHistory(chat.chatId, 20)
+		if len(lastMsgs) < 20 {
 			log.Fatalf("Can't get all last msgs")
 		}
 		log.Println("OK")
@@ -283,7 +389,7 @@ func Autopost() {
 					continue
 				}
 
-				for _, lastMsg := range lastMsgs.Messages {
+				for _, lastMsg := range lastMsgs {
 					if lastMsg.Id == msg.Id {
 						continue outer;
 					}
@@ -310,7 +416,7 @@ func Autopost() {
 		if msgs.TotalCount - deleted == 0{
 			fmt.Printf("sending to %s\n", chat.group.Username)
 			sendMessage(chat.chatId)
-			time.Sleep(time.Duration(8 + rand.Intn(90)) * time.Second)
+			time.Sleep(time.Duration(8 + rand.Intn(1)) * time.Second)
   		//os.Exit(1)
 		} else {
 			println("ignoring")
@@ -408,21 +514,11 @@ func getMessage(chatId int64) string {
 	}
 	return text
 }
-func logUpdates() {
-
-	listener := iClient.GetListener()
-	defer listener.Close()
-
-	for update := range listener.Updates {
-			log.Printf("%v %v %#v",update.GetClass(), update.GetType(), update)
-			saveUpdate(update)
-	}
-}
 
 func convertUserStatus(userStatus client.UserStatus) string {
 	return strings.ToLower(strings.Replace(userStatus.UserStatusType(), "userStatus", "", 1))
 }
-func getLastOnlineTimestamp(update *client.UpdateUserStatus) int64  {
+func getLastOnline(update *client.UpdateUserStatus) time.Time  {
 	var lastOnlineTime time.Time
 	switch update.Status.UserStatusType() {
 	case client.TypeUserStatusLastMonth:
@@ -438,7 +534,7 @@ func getLastOnlineTimestamp(update *client.UpdateUserStatus) int64  {
 		typedStatus := update.Status.(*client.UserStatusOnline)
 		lastOnlineTime = time.Unix(int64(typedStatus.Expires), 0)
 	}
-	return lastOnlineTime.Unix()
+	return lastOnlineTime.Truncate(time.Second)
 }
 
 func saveUpdate(update client.Type) {
@@ -446,24 +542,33 @@ func saveUpdate(update client.Type) {
 		time time.Time
 		userId int64
 		status string
-		lastOnline int64
+		lastOnline time.Time
 	}
 
+	indexName := "tg-assist.updates."
 	var doc interface{}
-		if updateUserStatus, ok := update.(*client.UpdateUserStatus); ok {
-			doc = UpdateUserStatus{
-				time: time.Now(),
-				userId: updateUserStatus.UserId,
-				status: convertUserStatus(updateUserStatus.Status),
-				lastOnline: getLastOnlineTimestamp(updateUserStatus),
-			}
-		} else {
-			return
+	if updateUserStatus, ok := update.(*client.UpdateUserStatus); ok {
+		doc = UpdateUserStatus{
+			time: time.Now(),
+			userId: updateUserStatus.UserId,
+			status: convertUserStatus(updateUserStatus.Status),
+			lastOnline: getLastOnline(updateUserStatus),
 		}
+		indexName+= "update_status"
+	}	else {
+		return
+	}
+
+	// indexName := "tg-assist.updates." + strings.Replace(update.GetType(), "update", "", 1)
+	res, err := es.Index(indexName, esutil.NewJSONReader(&doc))
+	check(err)
+	log.Println(res)
+
+}
 
 
-	res, _ := es.Index("tg-assist.updates.user-status", esutil.NewJSONReader(&doc))
-	fmt.Println(res)
+func saveNewMessages() {
+
 }
 // func saveUpdate(update client.Type) {
 
@@ -472,7 +577,6 @@ func saveUpdate(update client.Type) {
 // 		UserId int64
 // 		NewStatus string
 // 	}
-
 // 	nowNano := time.Now().UnixNano()
 // 	updateUserStatus, ok := update.(*client.UpdateUserStatus)
 // 	if ok {
@@ -585,25 +689,21 @@ func saveUpdate(update client.Type) {
 // 			log.Println("Can't open file for read", err)
 // 			return
 // 		}
-
 // 		pr, err := reader.NewParquetReader(fr, nil, 1)
 // 		if err != nil {
 // 			log.Println("Can't create parquet reader", err)
 // 			return
 // 		}
-
 // 		num := int(pr.GetNumRows())
 // 		res, err := pr.ReadByNumber(num)
 // 		if err != nil {
 // 			log.Println("Can't read rows", err)
 // 			return
 // 		}
-
 // 		table := ""
 // 		for _, row := range res {
 // 			table = table + fmt.Sprintf("%v\n", row)
 // 		}
-
 // 		log.Printf("Content of table:\n%s", table)
 // 		log.Print("Read Finished")
 // 	}
